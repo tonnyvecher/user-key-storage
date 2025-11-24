@@ -2,7 +2,7 @@ const express = require("express");
 const pool = require("./db");
 const { logAudit } = require("./audit");
 const { authKeycloakMiddleware } = require("./authMiddleware");
-const { encryptField, decryptField, signAccessOperation  } = require("./cryptoClient");
+const { encryptField, decryptField, signAccessOperation, rotateMasterKey } = require("./cryptoClient");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -222,6 +222,97 @@ app.get("/users/:id/roles", async (req, res) => {
     });
   }
 });
+
+// лёгкий эндпоинт в backend, который будет:
+// читать роли из user_roles,
+// для каждой роли:
+// если подписи нет → помечаем как «без подписи»;
+// если подпись есть → дергаем обёртку, пересчитываем HMAC и сравниваем.
+
+app.get("/users/:id/roles/verify", async (req, res) => {
+  try {
+    const userId = req.params.id;
+
+    // Берём все роли пользователя
+    const result = await pool.query(
+      "SELECT id, role_name, created_at, signature FROM user_roles WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId]
+    );
+
+    const rows = result.rows;
+
+    if (rows.length === 0) {
+      return res.json({
+        status: "ok",
+        count: 0,
+        roles: []
+      });
+    }
+
+    // Для каждой роли проверяем подпись (если она есть)
+    const rolesWithCheck = await Promise.all(
+      rows.map(async (row) => {
+        const base = {
+          id: row.id,
+          role_name: row.role_name,
+          created_at: row.created_at,
+          has_signature: !!row.signature
+        };
+
+        if (!row.signature) {
+          return {
+            ...base,
+            valid: false,
+            integrity: "missing_signature",
+            reason: "Role record has no cryptographic signature (legacy or tampered)"
+          };
+        }
+
+        try {
+          // Пересчитываем подпись через обёртку
+          const expected = await signAccessOperation(userId, row.role_name, "GRANT_ROLE");
+
+          if (expected === row.signature) {
+            return {
+              ...base,
+              valid: true,
+              integrity: "ok",
+              reason: "Signature matches HMAC(user_id, role_name, action)"
+            };
+          } else {
+            return {
+              ...base,
+              valid: false,
+              integrity: "signature_mismatch",
+              reason: "Stored signature does not match recomputed HMAC"
+            };
+          }
+        } catch (err) {
+          console.error("Error verifying role signature:", err);
+          return {
+            ...base,
+            valid: false,
+            integrity: "verification_error",
+            reason: "Error during HMAC verification: " + err.message
+          };
+        }
+      })
+    );
+
+    res.json({
+      status: "ok",
+      count: rolesWithCheck.length,
+      roles: rolesWithCheck
+    });
+  } catch (err) {
+    console.error("Error in /users/:id/roles/verify:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 
 /**
  * Внешние аккаунты пользователя (список)
@@ -453,43 +544,114 @@ app.post("/users/:id/profile", async (req, res) => {
  *
  * Пользователь определяется через authKeycloakMiddleware.
  */
-app.get("/secure-test", authKeycloakMiddleware, async (req, res) => {
+app.get("/secure-test", async (req, res) => {
   try {
-    const userId = req.user.id;
+    // 1. Определяем userId:
+    //    - если запрос пришёл с токеном Keycloak → берем из req.user.id
+    //    - если тестируешь через PowerShell → можно передать ?userId=...
+    const userId = req.user?.id || req.query.userId;
 
+    if (!userId) {
+      return res.status(400).json({
+        status: "error",
+        message: "userId is required (either from auth middleware or query param)"
+      });
+    }
+
+    // 2. Достаём все роли пользователя
     const result = await pool.query(
-      "SELECT 1 FROM user_roles WHERE user_id = $1 AND role_name = $2 LIMIT 1",
-      [userId, "ADMIN"]
+      "SELECT id, role_name, signature, created_at FROM user_roles WHERE user_id = $1",
+      [userId]
     );
 
-    if (result.rowCount === 0) {
-      await logAudit(userId, "SECURE_TEST_DENIED", {
-        required_role: "ADMIN"
+    if (result.rows.length === 0) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "User has no roles"
       });
+    }
 
+    // 3. Отбираем только ADMIN
+    const adminRoles = result.rows.filter((row) => row.role_name === "ADMIN");
+
+    if (adminRoles.length === 0) {
       return res.status(403).json({
         status: "forbidden",
         message: "User does not have ADMIN role"
       });
     }
 
-    await logAudit(userId, "SECURE_TEST_GRANTED", {
-      required_role: "ADMIN"
-    });
+    // 4. Проверяем подпись для ADMIN ролей
+    let hasValidAdmin = false;
+    const details = [];
 
-    res.json({
+    for (const row of adminRoles) {
+      const base = {
+        role_name: row.role_name,
+        signature: row.signature,
+        created_at: row.created_at
+      };
+
+      if (!row.signature) {
+        details.push({
+          ...base,
+          valid: false,
+          reason: "ADMIN role has no signature (legacy or tampered)"
+        });
+        continue;
+      }
+
+      try {
+        const expected = await signAccessOperation(userId, row.role_name, "GRANT_ROLE");
+
+        if (expected === row.signature) {
+          hasValidAdmin = true;
+          details.push({
+            ...base,
+            valid: true,
+            reason: "Signature matches HMAC(user_id, role_name, action)"
+          });
+          // можно break, но оставим как есть, если захочешь логировать все
+        } else {
+          details.push({
+            ...base,
+            valid: false,
+            reason: "Stored signature does not match recomputed HMAC"
+          });
+        }
+      } catch (err) {
+        console.error("Error verifying ADMIN signature in /secure-test:", err);
+        details.push({
+          ...base,
+          valid: false,
+          reason: "Error during HMAC verification: " + err.message
+        });
+      }
+    }
+
+    if (!hasValidAdmin) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "User's ADMIN roles are invalid or tampered",
+        roles: details
+      });
+    }
+
+    // 5. Если дошли до сюда — есть хотя бы один валидный ADMIN
+    return res.json({
       status: "ok",
-      message: "User has ADMIN role, access granted",
-      user: req.user
+      message: "User has valid ADMIN role, access granted",
+      roles: details
     });
   } catch (err) {
-    console.error("Error in secure-test:", err);
+    console.error("Error in /secure-test:", err);
     res.status(500).json({
       status: "error",
       message: err.message
     });
   }
 });
+
 
 
 /**
@@ -518,6 +680,23 @@ app.post("/auth/keycloak", authKeycloakMiddleware, (req, res) => {
   });
 });
 
+// Админ-эндпоинт для ротации мастер-ключа профиля.
+// В реальной системе его надо защищать, здесь — для демо.
+app.post("/admin/rotate-master", async (req, res) => {
+  try {
+    const result = await rotateMasterKey();
+    res.json({
+      status: "ok",
+      message: result
+    });
+  } catch (err) {
+    console.error("Error rotating master key:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
 
 app.listen(port, () => {
   console.log(`Backend listening on port ${port}`);
