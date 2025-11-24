@@ -36,3 +36,17 @@ export async function getRolesVerify(userId: string) {
 export async function secureTest(userId: string) {
   return apiGet<any>(`/secure-test?userId=${encodeURIComponent(userId)}`);
 }
+
+// список пользователей
+export async function listUsers() {
+  return apiGet<{
+    status: string;
+    count: number;
+    users: {
+      id: string;
+      primary_email: string;
+      is_active: boolean;
+      created_at: string;
+    }[];
+  }>('/users');
+}
