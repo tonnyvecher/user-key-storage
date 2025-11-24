@@ -3,6 +3,7 @@ import type { RouteRecordRaw } from 'vue-router';
 import HomeView from './views/HomeView.vue';
 import UsersView from './views/UsersView.vue';
 import UserDetailsView from './views/UserDetailsView.vue';
+import NotesView from './views/NotesView.vue';
 
 const routes: RouteRecordRaw[] = [
   {
@@ -20,7 +21,11 @@ const routes: RouteRecordRaw[] = [
     name: 'user-details',
     component: UserDetailsView,
     props: true
-  }
+  },
+  { 
+    path: '/notes',
+    name: 'notes',
+    component: NotesView }
 ];
 
 const router = createRouter({

@@ -66,3 +66,45 @@ export async function listUsersWithStatus() {
   }>('/admin/users/status');
 }
 
+export async function listNotes(userId: string) {
+  return apiGet<{
+    status: string;
+    user_id: string;
+    user_max_role_rank: number;
+    count: number;
+    notes: {
+      id: string;
+      owner_user_id: string;
+      title: string;
+      body: string;
+      min_role: string;
+      created_at: string;
+      updated_at: string;
+    }[];
+  }>(`/notes?userId=${encodeURIComponent(userId)}`);
+}
+
+export async function createNote(userId: string, payload: { title: string; body: string; min_role: string }) {
+  const res = await fetch(`${API_BASE}/notes?userId=${encodeURIComponent(userId)}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const text = await res.text();
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Некорректный JSON: ${text}`);
+  }
+
+  if (!res.ok) {
+    throw new Error(data.message || `${res.status} ${res.statusText}`);
+  }
+
+  return data;
+}
+

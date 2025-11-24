@@ -10,6 +10,7 @@
       <nav class="layout__nav">
         <RouterLink to="/" class="nav-link" active-class="nav-link--active" exact>Диагностика</RouterLink>
         <RouterLink to="/users" class="nav-link" active-class="nav-link--active">Пользователи</RouterLink>
+        <RouterLink to="/notes" class="nav-link" active-class="nav-link--active">Заметки</RouterLink>
       </nav>
     </header>
 

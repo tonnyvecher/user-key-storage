@@ -4,8 +4,48 @@ const { logAudit } = require("./audit");
 const { authKeycloakMiddleware } = require("./authMiddleware");
 const { encryptField, decryptField, signAccessOperation, rotateMasterKey } = require("./cryptoClient");
 
+// --------- Role hierarchy for notes access ---------
+const ROLE_RANK = {
+  USER: 1,
+  MANAGER: 2,
+  ADMIN: 3,
+  SUPERADMIN: 4,
+  OWNER: 5
+};
+
+function getRoleRank(roleName) {
+  if (!roleName) return 0;
+  const upper = String(roleName).toUpperCase();
+  return ROLE_RANK[upper] || 0;
+}
+
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Получаем максимальный уровень роли пользователя с учётом проверки подписи через /users/:id/roles/verify
+async function getUserMaxRoleRank(userId) {
+  try {
+    const verifyRes = await fetch(`http://localhost:${port}/users/${userId}/roles/verify`);
+    if (!verifyRes.ok) {
+      console.error("getUserMaxRoleRank: verify endpoint returned", verifyRes.status);
+      return 0;
+    }
+    const data = await verifyRes.json();
+    const roles = data.roles || [];
+
+    let maxRank = 0;
+    for (const r of roles) {
+      if (r.valid) {
+        const rank = getRoleRank(r.role_name);
+        if (rank > maxRank) maxRank = rank;
+      }
+    }
+    return maxRank;
+  } catch (e) {
+    console.error("getUserMaxRoleRank error:", e);
+    return 0;
+  }
+}
 
 app.use(express.json());
 
@@ -758,6 +798,160 @@ app.get("/admin/users/status", async (req, res) => {
   }
 });
 
+// -------- NOTES: доступ по ролям --------
+
+// Список заметок, доступных пользователю (по его максимальной роли)
+app.get("/notes", async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) {
+    return res.status(400).json({
+      status: "error",
+      message: "userId query param is required"
+    });
+  }
+
+  try {
+    const userRank = await getUserMaxRoleRank(userId);
+
+    const result = await pool.query(
+      "SELECT id, owner_user_id, title, body, min_role, created_at, updated_at FROM notes ORDER BY created_at DESC"
+    );
+
+    const visibleNotes = result.rows.filter((note) => {
+      const requiredRank = getRoleRank(note.min_role);
+      // Пользователь может читать заметку, если его ранг >= требуемого
+      return userRank >= requiredRank;
+    });
+
+    res.json({
+      status: "ok",
+      user_id: userId,
+      user_max_role_rank: userRank,
+      count: visibleNotes.length,
+      notes: visibleNotes
+    });
+  } catch (err) {
+    console.error("Error in GET /notes:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// Создание заметки. Создавать можно только в пределах своей максимальной роли.
+app.post("/notes", async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) {
+    return res.status(400).json({
+      status: "error",
+      message: "userId query param is required"
+    });
+  }
+
+  const { title, body, min_role } = req.body || {};
+
+  if (!title || !body || !min_role) {
+    return res.status(400).json({
+      status: "error",
+      message: "title, body and min_role are required"
+    });
+  }
+
+  const normalizedRole = String(min_role).toUpperCase();
+  const requiredRank = getRoleRank(normalizedRole);
+
+  if (requiredRank === 0) {
+    return res.status(400).json({
+      status: "error",
+      message: `Unknown min_role: ${min_role}`
+    });
+  }
+
+  try {
+    const userRank = await getUserMaxRoleRank(userId);
+
+    if (userRank === 0) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "User has no valid roles for note creation"
+      });
+    }
+
+    if (requiredRank > userRank) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: `You cannot create a note with min_role ${normalizedRole} higher than your max role`
+      });
+    }
+
+    const insertRes = await pool.query(
+      `INSERT INTO notes (owner_user_id, title, body, min_role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, owner_user_id, title, body, min_role, created_at, updated_at`,
+      [userId, title, body, normalizedRole]
+    );
+
+    res.status(201).json({
+      status: "ok",
+      note: insertRes.rows[0]
+    });
+  } catch (err) {
+    console.error("Error in POST /notes:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.get("/notes/:id", async (req, res) => {
+  const userId = req.query.userId;
+  const noteId = req.params.id;
+
+  if (!userId) {
+    return res.status(400).json({
+      status: "error",
+      message: "userId query param is required"
+    });
+  }
+
+  try {
+    const noteRes = await pool.query(
+      "SELECT id, owner_user_id, title, body, min_role, created_at, updated_at FROM notes WHERE id = $1",
+      [noteId]
+    );
+
+    if (noteRes.rowCount === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Note not found"
+      });
+    }
+
+    const note = noteRes.rows[0];
+    const requiredRank = getRoleRank(note.min_role);
+    const userRank = await getUserMaxRoleRank(userId);
+
+    if (userRank < requiredRank) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "Insufficient role to read this note"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      note
+    });
+  } catch (err) {
+    console.error("Error in GET /notes/:id:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
 
 app.listen(port, () => {
   console.log(`Backend listening on port ${port}`);
