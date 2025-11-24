@@ -223,6 +223,97 @@ app.get("/users/:id/roles", async (req, res) => {
   }
 });
 
+// лёгкий эндпоинт в backend, который будет:
+// читать роли из user_roles,
+// для каждой роли:
+// если подписи нет → помечаем как «без подписи»;
+// если подпись есть → дергаем обёртку, пересчитываем HMAC и сравниваем.
+
+app.get("/users/:id/roles/verify", async (req, res) => {
+  try {
+    const userId = req.params.id;
+
+    // Берём все роли пользователя
+    const result = await pool.query(
+      "SELECT id, role_name, created_at, signature FROM user_roles WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId]
+    );
+
+    const rows = result.rows;
+
+    if (rows.length === 0) {
+      return res.json({
+        status: "ok",
+        count: 0,
+        roles: []
+      });
+    }
+
+    // Для каждой роли проверяем подпись (если она есть)
+    const rolesWithCheck = await Promise.all(
+      rows.map(async (row) => {
+        const base = {
+          id: row.id,
+          role_name: row.role_name,
+          created_at: row.created_at,
+          has_signature: !!row.signature
+        };
+
+        if (!row.signature) {
+          return {
+            ...base,
+            valid: false,
+            integrity: "missing_signature",
+            reason: "Role record has no cryptographic signature (legacy or tampered)"
+          };
+        }
+
+        try {
+          // Пересчитываем подпись через обёртку
+          const expected = await signAccessOperation(userId, row.role_name, "GRANT_ROLE");
+
+          if (expected === row.signature) {
+            return {
+              ...base,
+              valid: true,
+              integrity: "ok",
+              reason: "Signature matches HMAC(user_id, role_name, action)"
+            };
+          } else {
+            return {
+              ...base,
+              valid: false,
+              integrity: "signature_mismatch",
+              reason: "Stored signature does not match recomputed HMAC"
+            };
+          }
+        } catch (err) {
+          console.error("Error verifying role signature:", err);
+          return {
+            ...base,
+            valid: false,
+            integrity: "verification_error",
+            reason: "Error during HMAC verification: " + err.message
+          };
+        }
+      })
+    );
+
+    res.json({
+      status: "ok",
+      count: rolesWithCheck.length,
+      roles: rolesWithCheck
+    });
+  } catch (err) {
+    console.error("Error in /users/:id/roles/verify:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
 /**
  * Внешние аккаунты пользователя (список)
  */
@@ -535,8 +626,6 @@ app.post("/admin/rotate-master", async (req, res) => {
     });
   }
 });
-
-
 
 app.listen(port, () => {
   console.log(`Backend listening on port ${port}`);
