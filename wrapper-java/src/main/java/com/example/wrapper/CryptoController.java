@@ -181,40 +181,26 @@ public class CryptoController {
             throw new IllegalArgumentException("user_id and field are required for per-user key derivation");
         }
 
+        // 1) пробуем current мастер-ключ
         try {
-            SecretKeySpec masterKey = vaultKeyService.getAesKey();
-            byte[] masterBytes = masterKey.getEncoded();
-
-            String infoStr = "profile:" + req.user_id + ":" + req.field;
-            byte[] info = infoStr.getBytes(StandardCharsets.UTF_8);
-            byte[] userKeyBytes = hkdfExpand(masterBytes, info, 32);
-
-            SecretKeySpec userKey = new SecretKeySpec(userKeyBytes, "AES");
-
-            byte[] combined = Base64.getDecoder().decode(req.ciphertext);
-
-            if (combined.length < IV_LENGTH_BYTES + 16) {
-                throw new IllegalArgumentException("ciphertext too short");
-            }
-
-            byte[] iv = new byte[IV_LENGTH_BYTES];
-            byte[] cipherBytes = new byte[combined.length - IV_LENGTH_BYTES];
-
-            System.arraycopy(combined, 0, iv, 0, IV_LENGTH_BYTES);
-            System.arraycopy(combined, IV_LENGTH_BYTES, cipherBytes, 0, cipherBytes.length);
-
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            GCMParameterSpec spec = new GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv);
-            cipher.init(Cipher.DECRYPT_MODE, userKey, spec);
-
-            byte[] plaintextBytes = cipher.doFinal(cipherBytes);
-            String plaintext = new String(plaintextBytes, StandardCharsets.UTF_8);
-
+            SecretKeySpec currentMaster = vaultKeyService.getAesKey();
+            String plaintext = decryptWithMaster(req, currentMaster);
             return new DecryptResponse(plaintext);
         } catch (Exception e) {
-            throw new RuntimeException("AES-GCM decrypt error: " + e.getMessage(), e);
+            // 2) если есть prev-ключ — пробуем его
+            SecretKeySpec prevMaster = vaultKeyService.getPrevAesKeyOrNull();
+            if (prevMaster == null) {
+                throw new RuntimeException("AES-GCM decrypt error (current key only): " + e.getMessage(), e);
+            }
+            try {
+                String plaintext = decryptWithMaster(req, prevMaster);
+                return new DecryptResponse(plaintext);
+            } catch (Exception e2) {
+                throw new RuntimeException("AES-GCM decrypt error (current & prev keys failed): " + e2.getMessage(), e2);
+            }
         }
     }
+
 
     /**
      * Подпись операций назначения ролей:
@@ -286,4 +272,48 @@ public class CryptoController {
 
         return result;
     }
+
+        /**
+     * Расшифровка с конкретным мастер-ключом:
+     * HKDF(master, "profile:user_id:field") -> per-user ключ -> AES-GCM.
+     */
+    private String decryptWithMaster(DecryptRequest req, SecretKeySpec masterKey) throws Exception {
+        byte[] masterBytes = masterKey.getEncoded();
+    
+        String infoStr = "profile:" + req.user_id + ":" + req.field;
+        byte[] info = infoStr.getBytes(StandardCharsets.UTF_8);
+        byte[] userKeyBytes = hkdfExpand(masterBytes, info, 32);
+    
+        SecretKeySpec userKey = new SecretKeySpec(userKeyBytes, "AES");
+    
+        byte[] combined = java.util.Base64.getDecoder().decode(req.ciphertext);
+    
+        if (combined.length < IV_LENGTH_BYTES + 16) {
+            throw new IllegalArgumentException("ciphertext too short");
+        }
+    
+        byte[] iv = new byte[IV_LENGTH_BYTES];
+        byte[] cipherBytes = new byte[combined.length - IV_LENGTH_BYTES];
+    
+        System.arraycopy(combined, 0, iv, 0, IV_LENGTH_BYTES);
+        System.arraycopy(combined, IV_LENGTH_BYTES, cipherBytes, 0, cipherBytes.length);
+    
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec spec = new GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv);
+        cipher.init(Cipher.DECRYPT_MODE, userKey, spec);
+    
+        byte[] plaintextBytes = cipher.doFinal(cipherBytes);
+        return new String(plaintextBytes, StandardCharsets.UTF_8);
+    }
+    
+    @PostMapping("/crypto/rotate-master")
+    public String rotateMaster() {
+        try {
+            vaultKeyService.rotateAesMasterKey();
+            return "master key rotated";
+        } catch (Exception e) {
+            throw new RuntimeException("Rotate master key error: " + e.getMessage(), e);
+        }
+    }
+
 }

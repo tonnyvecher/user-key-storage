@@ -21,11 +21,18 @@ public class VaultKeyService {
     private final String vaultAddr;
     private final String vaultToken;
 
-    // AES key (для шифрования профиля)
-    private volatile SecretKeySpec cachedAesKey;
-    private volatile String cachedAesKeyId = "master-v1";
+    // ---------- AES (профиль) ----------
 
-    // HMAC key (для подписи операций доступа)
+    // Текущий мастер-ключ профиля
+    private volatile SecretKeySpec cachedAesCurrentKey;
+    private volatile String cachedAesCurrentKeyId = "master-v1";
+
+    // Предыдущий мастер-ключ профиля (для расшифровки старых данных)
+    private volatile SecretKeySpec cachedAesPrevKey;
+    private volatile String cachedAesPrevKeyId = null;
+
+    // ---------- HMAC (роли/доступ) ----------
+
     private volatile byte[] cachedHmacKey;
     private volatile String cachedHmacKeyId = "access-hmac-v1";
 
@@ -34,35 +41,109 @@ public class VaultKeyService {
         this.vaultToken = System.getenv().getOrDefault("VAULT_TOKEN", "root");
     }
 
-    // ---------- AES-ключ ----------
+    // ================= AES: публичные методы =================
 
     public SecretKeySpec getAesKey() {
-        if (cachedAesKey != null) {
-            return cachedAesKey;
-        }
+        ensureAesKeysLoaded();
+        return cachedAesCurrentKey;
+    }
 
-        synchronized (this) {
-            if (cachedAesKey != null) {
-                return cachedAesKey;
-            }
-            try {
-                SecretKeySpec key = loadAesKeyFromVault();
-                if (key == null) {
-                    key = generateAndStoreAesKeyInVault();
-                }
-                cachedAesKey = key;
-                return key;
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to obtain AES key from Vault", e);
-            }
-        }
+    public SecretKeySpec getPrevAesKeyOrNull() {
+        ensureAesKeysLoaded();
+        return cachedAesPrevKey;
     }
 
     public String getKeyId() {
-        return cachedAesKeyId;
+        ensureAesKeysLoaded();
+        return cachedAesCurrentKeyId;
     }
 
-    private SecretKeySpec loadAesKeyFromVault() throws Exception {
+    /**
+     * Ротация мастер-ключа профиля:
+     * prev <- current, current <- new.
+     */
+    public synchronized void rotateAesMasterKey() throws Exception {
+        ensureAesKeysLoaded();
+
+        // старый current станет prev
+        SecretKeySpec oldCurrent = cachedAesCurrentKey;
+        String oldCurrentId = cachedAesCurrentKeyId;
+
+        // генерируем новый current
+        byte[] newKeyBytes = new byte[32]; // 256 bit
+        SecureRandom random = new SecureRandom();
+        random.nextBytes(newKeyBytes);
+
+        String newKeyHex = bytesToHex(newKeyBytes);
+        String newKeyId = nextVersionId(oldCurrentId);
+
+        // готовим JSON для Vault
+        ObjectNode dataInner = objectMapper.createObjectNode();
+        dataInner.put("current_key_hex", newKeyHex);
+        dataInner.put("current_key_id", newKeyId);
+
+        if (oldCurrent != null) {
+            dataInner.put("prev_key_hex", bytesToHex(oldCurrent.getEncoded()));
+            dataInner.put("prev_key_id", oldCurrentId);
+        }
+
+        // для совместимости оставим старые поля
+        dataInner.put("key_hex", newKeyHex);
+        dataInner.put("key_id", newKeyId);
+        dataInner.put("algo", "AES-256-GCM");
+
+        ObjectNode outer = objectMapper.createObjectNode();
+        outer.set("data", dataInner);
+
+        String body = objectMapper.writeValueAsString(outer);
+
+        String url = vaultAddr + "/v1/secret/data/crypto/master-key";
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("X-Vault-Token", vaultToken)
+                .header("Content-Type", "application/json")
+                .PUT(HttpRequest.BodyPublishers.ofString(body))
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() / 100 != 2) {
+            System.out.println("VaultKeyService: Vault AES rotate write error, status=" +
+                    response.statusCode() + " body=" + response.body());
+            throw new RuntimeException("Vault AES rotate write error: " + response.statusCode());
+        }
+
+        // обновляем кэш
+        cachedAesPrevKey = oldCurrent;
+        cachedAesPrevKeyId = oldCurrentId;
+
+        cachedAesCurrentKey = new SecretKeySpec(newKeyBytes, "AES");
+        cachedAesCurrentKeyId = newKeyId;
+
+        System.out.println("VaultKeyService: rotated AES master key, new current_id=" + newKeyId +
+                ", prev_id=" + oldCurrentId);
+    }
+
+    // ================= AES: внутренняя загрузка =================
+
+    private void ensureAesKeysLoaded() {
+        if (cachedAesCurrentKey != null) {
+            return;
+        }
+        synchronized (this) {
+            if (cachedAesCurrentKey != null) {
+                return;
+            }
+            try {
+                loadAesKeysFromVaultOrGenerate();
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to load AES keys from Vault", e);
+            }
+        }
+    }
+
+    private void loadAesKeysFromVaultOrGenerate() throws Exception {
         String url = vaultAddr + "/v1/secret/data/crypto/master-key";
 
         HttpRequest request = HttpRequest.newBuilder()
@@ -74,8 +155,9 @@ public class VaultKeyService {
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() == 404) {
-            System.out.println("VaultKeyService: AES master key not found in Vault (404)");
-            return null;
+            System.out.println("VaultKeyService: AES master key not found in Vault (404), generating new");
+            generateAndStoreInitialAesKey();
+            return;
         }
 
         if (response.statusCode() / 100 != 2) {
@@ -87,34 +169,67 @@ public class VaultKeyService {
         JsonNode root = objectMapper.readTree(response.body());
         JsonNode dataNode = root.path("data").path("data");
 
-        String keyHex = dataNode.path("key_hex").asText(null);
-        String keyId = dataNode.path("key_id").asText("master-v1");
+        // Новый формат: current_key_hex / prev_key_hex
+        String currentKeyHex = dataNode.path("current_key_hex").asText(null);
+        String currentKeyId = dataNode.path("current_key_id").asText(null);
 
-        if (keyHex == null || keyHex.isEmpty()) {
-            System.out.println("VaultKeyService: AES key_hex is missing");
-            return null;
+        String prevKeyHex = dataNode.path("prev_key_hex").asText(null);
+        String prevKeyId = dataNode.path("prev_key_id").asText(null);
+
+        // Старый формат: key_hex / key_id
+        String legacyKeyHex = dataNode.path("key_hex").asText(null);
+        String legacyKeyId = dataNode.path("key_id").asText("master-v1");
+
+        if (currentKeyHex != null && !currentKeyHex.isEmpty()) {
+            byte[] currentBytes = hexToBytes(currentKeyHex);
+            cachedAesCurrentKey = new SecretKeySpec(currentBytes, "AES");
+            cachedAesCurrentKeyId = (currentKeyId != null && !currentKeyId.isEmpty())
+                    ? currentKeyId
+                    : "master-v1";
+
+            if (prevKeyHex != null && !prevKeyHex.isEmpty()) {
+                byte[] prevBytes = hexToBytes(prevKeyHex);
+                cachedAesPrevKey = new SecretKeySpec(prevBytes, "AES");
+                cachedAesPrevKeyId = prevKeyId;
+            }
+
+            System.out.println("VaultKeyService: loaded AES keys from Vault, current_id=" +
+                    cachedAesCurrentKeyId + ", prev_id=" + cachedAesPrevKeyId);
+        } else if (legacyKeyHex != null && !legacyKeyHex.isEmpty()) {
+            // Совместимость со старым форматом (один ключ)
+            byte[] keyBytes = hexToBytes(legacyKeyHex);
+            cachedAesCurrentKey = new SecretKeySpec(keyBytes, "AES");
+            cachedAesCurrentKeyId = legacyKeyId;
+
+            cachedAesPrevKey = null;
+            cachedAesPrevKeyId = null;
+
+            System.out.println("VaultKeyService: loaded AES legacy key from Vault, key_id=" +
+                    cachedAesCurrentKeyId);
+        } else {
+            System.out.println("VaultKeyService: no AES key data in Vault, generating new");
+            generateAndStoreInitialAesKey();
         }
-
-        byte[] keyBytes = hexToBytes(keyHex);
-        cachedAesKeyId = keyId;
-
-        System.out.println("VaultKeyService: loaded AES key from Vault, key_id=" + cachedAesKeyId);
-        return new SecretKeySpec(keyBytes, "AES");
     }
 
-    private SecretKeySpec generateAndStoreAesKeyInVault() throws Exception {
+    private void generateAndStoreInitialAesKey() throws Exception {
         byte[] keyBytes = new byte[32]; // 256 bit
         SecureRandom random = new SecureRandom();
         random.nextBytes(keyBytes);
 
         String keyHex = bytesToHex(keyBytes);
+        cachedAesCurrentKeyId = "master-v1";
 
         String url = vaultAddr + "/v1/secret/data/crypto/master-key";
 
         ObjectNode dataInner = objectMapper.createObjectNode();
+        dataInner.put("current_key_hex", keyHex);
+        dataInner.put("current_key_id", cachedAesCurrentKeyId);
+
+        // Для совместимости
         dataInner.put("key_hex", keyHex);
+        dataInner.put("key_id", cachedAesCurrentKeyId);
         dataInner.put("algo", "AES-256-GCM");
-        dataInner.put("key_id", cachedAesKeyId);
 
         ObjectNode outer = objectMapper.createObjectNode();
         outer.set("data", dataInner);
@@ -131,16 +246,37 @@ public class VaultKeyService {
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() / 100 != 2) {
-            System.out.println("VaultKeyService: Vault AES write error, status=" +
+            System.out.println("VaultKeyService: Vault AES initial write error, status=" +
                     response.statusCode() + " body=" + response.body());
-            throw new RuntimeException("Vault AES write error: " + response.statusCode());
+            throw new RuntimeException("Vault AES initial write error: " + response.statusCode());
         }
 
-        System.out.println("VaultKeyService: generated new AES key and stored in Vault, key_id=" + cachedAesKeyId);
-        return new SecretKeySpec(keyBytes, "AES");
+        cachedAesCurrentKey = new SecretKeySpec(keyBytes, "AES");
+        cachedAesPrevKey = null;
+        cachedAesPrevKeyId = null;
+
+        System.out.println("VaultKeyService: generated initial AES master key, id=" + cachedAesCurrentKeyId);
     }
 
-    // ---------- HMAC-ключ ----------
+    private static String nextVersionId(String currentId) {
+        if (currentId == null || currentId.isEmpty()) {
+            return "master-v1";
+        }
+        int idx = currentId.lastIndexOf("-v");
+        if (idx == -1) {
+            return currentId + "-v2";
+        }
+        String prefix = currentId.substring(0, idx);
+        String numStr = currentId.substring(idx + 2);
+        try {
+            int n = Integer.parseInt(numStr);
+            return prefix + "-v" + (n + 1);
+        } catch (NumberFormatException e) {
+            return currentId + "-v2";
+        }
+    }
+
+    // ================= HMAC: публичные методы =================
 
     public byte[] getHmacKey() {
         if (cachedHmacKey != null) {
@@ -246,7 +382,7 @@ public class VaultKeyService {
         return keyBytes;
     }
 
-    // ---------- Вспомогательные методы ----------
+    // ================= Вспомогательные методы =================
 
     private static byte[] hexToBytes(String hex) {
         if (hex == null) {

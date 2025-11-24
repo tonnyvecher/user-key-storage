@@ -77,9 +77,26 @@ async function signAccessOperation(userId, roleName, action = "GRANT_ROLE") {
   return data.hmac; // base64 подпись
 }
 
+async function rotateMasterKey() {
+  const fetch = await getFetch();
+
+  const res = await fetch(`${WRAPPER_BASE_URL}/crypto/rotate-master`, {
+    method: "POST"
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Rotate master key error: ${res.status} ${text}`);
+  }
+
+  return await res.text();
+}
+
+
 
 module.exports = {
   encryptField,
   decryptField,
-  signAccessOperation
+  signAccessOperation,
+  rotateMasterKey
 };

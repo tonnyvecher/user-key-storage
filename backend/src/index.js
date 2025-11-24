@@ -2,7 +2,7 @@ const express = require("express");
 const pool = require("./db");
 const { logAudit } = require("./audit");
 const { authKeycloakMiddleware } = require("./authMiddleware");
-const { encryptField, decryptField, signAccessOperation  } = require("./cryptoClient");
+const { encryptField, decryptField, signAccessOperation, rotateMasterKey } = require("./cryptoClient");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -517,6 +517,25 @@ app.post("/auth/keycloak", authKeycloakMiddleware, (req, res) => {
     }
   });
 });
+
+// Админ-эндпоинт для ротации мастер-ключа профиля.
+// В реальной системе его надо защищать, здесь — для демо.
+app.post("/admin/rotate-master", async (req, res) => {
+  try {
+    const result = await rotateMasterKey();
+    res.json({
+      status: "ok",
+      message: result
+    });
+  } catch (err) {
+    console.error("Error rotating master key:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 
 
 app.listen(port, () => {
