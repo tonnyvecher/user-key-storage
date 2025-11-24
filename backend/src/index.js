@@ -698,6 +698,67 @@ app.post("/admin/rotate-master", async (req, res) => {
   }
 });
 
+// -------- ADMIN: статус пользователей и целостность ролей --------
+app.get("/admin/users/status", async (req, res) => {
+  try {
+    // 1. Берём всех пользователей из БД
+    const usersRes = await pool.query(
+      "SELECT id, primary_email, is_active, created_at FROM users ORDER BY created_at DESC"
+    );
+    const users = usersRes.rows;
+
+    const results = [];
+
+    // 2. Для каждого пользователя дергаем уже существующий эндпоинт /users/:id/roles/verify
+    for (const u of users) {
+      let rolesCount = 0;
+      let hasIssues = false;
+
+      try {
+        const verifyRes = await fetch(
+          `http://localhost:${port}/users/${u.id}/roles/verify`
+        );
+
+        if (verifyRes.ok) {
+          const data = await verifyRes.json();
+          const roles = data.roles || [];
+          rolesCount = data.count ?? roles.length;
+          // есть ли хотя бы одна роль с проблемой (valid === false)
+          hasIssues = roles.some((r) => r.valid === false);
+        } else {
+          // если сам запрос /roles/verify вернул ошибку — считаем, что есть проблемы
+          hasIssues = true;
+        }
+      } catch (e) {
+        console.error("Error checking roles for user", u.id, e);
+        hasIssues = true;
+      }
+
+      results.push({
+        id: u.id,
+        primary_email: u.primary_email,
+        is_active: u.is_active,
+        created_at: u.created_at,
+        roles_count: rolesCount,
+        has_issues: hasIssues
+      });
+    }
+
+    res.json({
+      status: "ok",
+      count: results.length,
+      users: results
+    });
+  } catch (err) {
+    console.error("Error in /admin/users/status:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
 app.listen(port, () => {
   console.log(`Backend listening on port ${port}`);
 });

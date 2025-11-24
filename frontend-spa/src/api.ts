@@ -50,3 +50,19 @@ export async function listUsers() {
     }[];
   }>('/users');
 }
+
+export async function listUsersWithStatus() {
+  return apiGet<{
+    status: string;
+    count: number;
+    users: {
+      id: string;
+      primary_email: string;
+      is_active: boolean;
+      created_at: string;
+      roles_count: number;
+      has_issues: boolean;
+    }[];
+  }>('/admin/users/status');
+}
+
