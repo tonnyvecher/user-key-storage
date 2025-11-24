@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>User Key Storage – Demo UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Vue 3 через CDN -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .app {
+      max-width: 900px;
+      margin: 0 auto;
+      background: #fff;
+      border-radius: 12px;
+      padding: 20px 24px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 22px;
+    }
+    .field {
+      margin-bottom: 12px;
+    }
+    .field label {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 4px;
+    }
+    .field input {
+      width: 100%;
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      font-size: 14px;
+    }
+    .buttons {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 12px 0 20px;
+    }
+    button {
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      font-size: 14px;
+      background: #2563eb;
+      color: #fff;
+    }
+    button.secondary {
+      background: #6b7280;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    .section-title {
+      margin-top: 20px;
+      font-weight: 600;
+      font-size: 16px;
+    }
+    pre {
+      background: #111827;
+      color: #e5e7eb;
+      padding: 10px 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .tag {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 500;
+      margin-left: 6px;
+    }
+    .tag.ok {
+      background: #dcfce7;
+      color: #166534;
+    }
+    .tag.bad {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="app">
+    <h1>Демо UI: профиль и роли пользователя</h1>
+    <p style="font-size: 13px; color: #4b5563;">
+      Бэкенд: <code>/api/users/:id/profile</code>, <code>/api/users/:id/roles/verify</code>, <code>/api/secure-test</code>.
+      Здесь мы просто дергаем нашу систему и смотрим, как работают шифрование и подписи.
+    </p>
+
+    <div class="field">
+      <label for="userId">userId (UUID из БД / Keycloak):</label>
+      <input id="userId" v-model="userId" placeholder="вставь сюда UUID пользователя" />
+    </div>
+
+    <div class="buttons">
+      <button @click="loadProfile" :disabled="!userId || loading">Загрузить профиль</button>
+      <button @click="loadRoles" class="secondary" :disabled="!userId || loading">Проверить роли</button>
+      <button @click="runSecureTest" class="secondary" :disabled="!userId || loading">Проверить доступ (/secure-test)</button>
+    </div>
+
+    <div v-if="error" style="color:#b91c1c; font-size:13px; margin-bottom:10px;">
+      Ошибка: {{ error }}
+    </div>
+
+    <div v-if="profile" style="margin-top: 10px;">
+      <div class="section-title">
+        Профиль
+      </div>
+      <pre>{{ profile }}</pre>
+    </div>
+
+    <div v-if="roles" style="margin-top: 10px;">
+      <div class="section-title">
+        Роли и целостность
+      </div>
+      <div v-if="roles.roles && roles.roles.length === 0" style="font-size:13px; color:#6b7280;">
+        Ролей нет.
+      </div>
+      <div v-else>
+        <div v-for="r in roles.roles" :key="r.id || r.role_name" style="margin-bottom: 6px; font-size: 13px;">
+          <strong>{{ r.role_name }}</strong>
+          <span v-if="r.valid" class="tag ok">OK</span>
+          <span v-else class="tag bad">Проблема</span>
+          <div style="color:#6b7280;">
+            {{ r.reason }}
+          </div>
+        </div>
+      </div>
+      <pre>{{ roles }}</pre>
+    </div>
+
+    <div v-if="secureTest" style="margin-top: 10px;">
+      <div class="section-title">
+        Результат /secure-test
+      </div>
+      <pre>{{ secureTest }}</pre>
+    </div>
+  </div>
+</div>
+
+<script>
+    const { createApp, ref } = Vue;
+  
+    createApp({
+      setup() {
+        const userId = ref("");
+        const profile = ref(null);
+        const roles = ref(null);
+        const secureTest = ref(null);
+        const error = ref(null);
+        const loading = ref(false);
+  
+        async function apiGet(path) {
+          error.value = null;
+          loading.value = true;
+          try {
+            const res = await fetch(path);
+            const text = await res.text();
+            let data;
+            try {
+              data = JSON.parse(text);
+            } catch {
+              throw new Error("Некорректный JSON: " + text);
+            }
+            if (!res.ok) {
+              throw new Error(data.message || res.status + " " + res.statusText);
+            }
+            return data;
+          } finally {
+            loading.value = false;
+          }
+        }
+  
+        async function loadProfile() {
+          if (!userId.value) return;
+          try {
+            const data = await apiGet(`/api/users/${userId.value}/profile`);
+            profile.value = JSON.stringify(data, null, 2);
+          } catch (e) {
+            profile.value = null;
+            error.value = e.message;
+          }
+        }
+  
+        async function loadRoles() {
+          if (!userId.value) return;
+          try {
+            const data = await apiGet(`/api/users/${userId.value}/roles/verify`);
+            roles.value = data;
+          } catch (e) {
+            roles.value = null;
+            error.value = e.message;
+          }
+        }
+  
+        async function runSecureTest() {
+          if (!userId.value) return;
+          try {
+            const data = await apiGet(
+              `/api/secure-test?userId=${encodeURIComponent(userId.value)}`
+            );
+            secureTest.value = JSON.stringify(data, null, 2);
+          } catch (e) {
+            // 403 и прочие ошибки тоже показываем
+            secureTest.value = `Ошибка /secure-test: ${e.message}`;
+            // не пишем в error, чтобы не краснело всё сверху
+          }
+        }
+  
+        return {
+          userId,
+          profile,
+          roles,
+          secureTest,
+          error,
+          loading,
+          loadProfile,
+          loadRoles,
+          runSecureTest
+        };
+      }
+    }).mount("#app");
+</script>  
+</body>
+</html>
