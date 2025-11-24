@@ -953,6 +953,128 @@ app.get("/notes/:id", async (req, res) => {
   }
 });
 
+// Обновление заметки: только владелец, внутри своей максимальной роли
+app.put("/notes/:id", async (req, res) => {
+  const userId = req.query.userId;
+  const noteId = req.params.id;
+
+  if (!userId) {
+    return res.status(400).json({
+      status: "error",
+      message: "userId query param is required"
+    });
+  }
+
+  const { title, body, min_role } = req.body || {};
+
+  if (!title && !body && !min_role) {
+    return res.status(400).json({
+      status: "error",
+      message: "At least one of title, body or min_role must be provided"
+    });
+  }
+
+  try {
+    // 1. Читаем заметку
+    const noteRes = await pool.query(
+      "SELECT id, owner_user_id, title, body, min_role, created_at, updated_at FROM notes WHERE id = $1",
+      [noteId]
+    );
+
+    if (noteRes.rowCount === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Note not found"
+      });
+    }
+
+    const note = noteRes.rows[0];
+
+    // 2. Проверяем, что пользователь — владелец
+    if (String(note.owner_user_id) !== String(userId)) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "Only owner can edit this note"
+      });
+    }
+
+    // 3. Проверяем, что его максимальная роль >= текущего min_role заметки
+    const userRank = await getUserMaxRoleRank(userId);
+    const currentRequiredRank = getRoleRank(note.min_role);
+
+    if (userRank < currentRequiredRank) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "Your max role is not enough to edit this note"
+      });
+    }
+
+    // 4. Если меняем min_role — проверяем, что новая роль не выше max роли пользователя
+    let newMinRole = note.min_role;
+    if (min_role) {
+      const normalizedRole = String(min_role).toUpperCase();
+      const newRank = getRoleRank(normalizedRole);
+
+      if (newRank === 0) {
+        return res.status(400).json({
+          status: "error",
+          message: `Unknown min_role: ${min_role}`
+        });
+      }
+
+      if (newRank > userRank) {
+        return res.status(403).json({
+          status: "forbidden",
+          message: `You cannot set min_role ${normalizedRole} higher than your max role`
+        });
+      }
+
+      newMinRole = normalizedRole;
+    }
+
+    // 5. Формируем динамический UPDATE (обновляем только то, что реально передали)
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    if (title) {
+      fields.push(`title = $${idx++}`);
+      values.push(title);
+    }
+    if (body) {
+      fields.push(`body = $${idx++}`);
+      values.push(body);
+    }
+    if (min_role) {
+      fields.push(`min_role = $${idx++}`);
+      values.push(newMinRole);
+    }
+
+    fields.push(`updated_at = now()`);
+
+    const updateQuery = `
+      UPDATE notes
+      SET ${fields.join(", ")}
+      WHERE id = $${idx}
+      RETURNING id, owner_user_id, title, body, min_role, created_at, updated_at
+    `;
+    values.push(noteId);
+
+    const updateRes = await pool.query(updateQuery, values);
+
+    res.json({
+      status: "ok",
+      note: updateRes.rows[0]
+    });
+  } catch (err) {
+    console.error("Error in PUT /notes/:id:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Backend listening on port ${port}`);
 });

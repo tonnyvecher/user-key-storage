@@ -108,3 +108,32 @@ export async function createNote(userId: string, payload: { title: string; body:
   return data;
 }
 
+export async function updateNote(
+  userId: string,
+  noteId: string,
+  payload: { title?: string; body?: string; min_role?: string }
+) {
+  const res = await fetch(`${API_BASE}/notes/${encodeURIComponent(noteId)}?userId=${encodeURIComponent(userId)}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const text = await res.text();
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Некорректный JSON: ${text}`);
+  }
+
+  if (!res.ok) {
+    throw new Error(data.message || `${res.status} ${res.statusText}`);
+  }
+
+  return data;
+}
+
+

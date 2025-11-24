@@ -4,8 +4,10 @@
       <p class="hint">
         Здесь можно создавать заметки с минимальной ролью доступа (USER / MANAGER / ADMIN / SUPERADMIN / OWNER).
         Доступ к заметкам определяется максимальной валидной ролью пользователя в нашей системе.
+        Редактировать заметку может только её владелец и только в пределах своей максимальной роли.
       </p>
   
+      <!-- 1. Выбор пользователя -->
       <section class="section">
         <h3 class="section__title">1. Выбор пользователя</h3>
         <div class="field">
@@ -34,6 +36,7 @@
         </div>
       </section>
   
+      <!-- 2. Создание заметки -->
       <section class="section">
         <h3 class="section__title">2. Создать заметку</h3>
         <p class="hint">
@@ -72,6 +75,7 @@
         <div v-if="noteSuccess" class="success">{{ noteSuccess }}</div>
       </section>
   
+      <!-- 3. Список заметок + редактирование -->
       <section class="section">
         <h3 class="section__title">3. Доступные заметки для выбранного пользователя</h3>
         <div v-if="notes.length === 0 && !loading" class="info">
@@ -80,17 +84,63 @@
   
         <div v-for="n in notes" :key="n.id" class="note">
           <div class="note__header">
-            <div class="note__title">{{ n.title }}</div>
+            <div class="note__title" v-if="editingNoteId !== n.id">
+              {{ n.title }}
+            </div>
+            <div class="note__title" v-else>
+              <input v-model="editTitle" />
+            </div>
+  
             <span class="pill">
-              min_role: <strong>{{ n.min_role }}</strong>
+              min_role:
+              <strong v-if="editingNoteId !== n.id">{{ n.min_role }}</strong>
+              <select v-else v-model="editMinRole" class="min-role-select">
+                <option
+                  v-for="r in availableMinRoles"
+                  :key="r"
+                  :value="r"
+                >
+                  {{ r }}
+                </option>
+              </select>
             </span>
           </div>
+  
           <div class="note__meta">
             <span>owner: <code>{{ shortId(n.owner_user_id) }}</code></span>
             <span>создано: {{ formatDate(n.created_at) }}</span>
           </div>
-          <div class="note__body">
+  
+          <div class="note__body" v-if="editingNoteId !== n.id">
             {{ n.body }}
+          </div>
+          <div class="note__body" v-else>
+            <textarea v-model="editBody" rows="3" />
+          </div>
+  
+          <div class="note__actions" v-if="userId && String(n.owner_user_id) === String(userId)">
+            <button
+              v-if="editingNoteId !== n.id"
+              class="btn btn--small"
+              @click="startEdit(n)"
+            >
+              Редактировать
+            </button>
+            <template v-else>
+              <button class="btn btn--small" @click="saveEdit(n.id)" :disabled="savingEdit">
+                Сохранить
+              </button>
+              <button class="btn btn--small btn--secondary" @click="cancelEdit" :disabled="savingEdit">
+                Отмена
+              </button>
+            </template>
+          </div>
+  
+          <div v-if="editError && editingNoteId === n.id" class="error">
+            {{ editError }}
+          </div>
+          <div v-if="editSuccess && editingNoteId === n.id" class="success">
+            {{ editSuccess }}
           </div>
         </div>
       </section>
@@ -99,7 +149,7 @@
   
 <script setup lang="ts">
   import { computed, ref } from 'vue';
-  import { getRolesVerify, listNotes, createNote } from '../api';
+  import { getRolesVerify, listNotes, createNote, updateNote } from '../api';
   
   const userId = ref('');
   const loading = ref(false);
@@ -115,6 +165,15 @@
   const newMinRole = ref('');
   const noteError = ref<string | null>(null);
   const noteSuccess = ref<string | null>(null);
+  
+  // state для редактирования
+  const editingNoteId = ref<string | null>(null);
+  const editTitle = ref('');
+  const editBody = ref('');
+  const editMinRole = ref('');
+  const savingEdit = ref(false);
+  const editError = ref<string | null>(null);
+  const editSuccess = ref<string | null>(null);
   
   const validRoles = computed(() =>
     (rolesData.value?.roles || []).filter((r: any) => r.valid)
@@ -182,6 +241,7 @@
     error.value = null;
     noteError.value = null;
     noteSuccess.value = null;
+    cancelEdit();
   
     try {
       // 1) загружаем роли и считаем max
@@ -231,6 +291,61 @@
       notes.value = notesRes.notes || [];
     } catch (e: any) {
       noteError.value = e.message || String(e);
+    }
+  }
+  
+  // ---- редактирование ----
+  function startEdit(note: any) {
+    editingNoteId.value = note.id;
+    editTitle.value = note.title;
+    editBody.value = note.body;
+    editMinRole.value = note.min_role;
+    editError.value = null;
+    editSuccess.value = null;
+  }
+  
+  function cancelEdit() {
+    editingNoteId.value = null;
+    editTitle.value = '';
+    editBody.value = '';
+    editMinRole.value = '';
+    editError.value = null;
+    editSuccess.value = null;
+  }
+  
+  async function saveEdit(noteId: string) {
+    if (!editingNoteId.value || editingNoteId.value !== noteId) return;
+    if (!userId.value) return;
+  
+    savingEdit.value = true;
+    editError.value = null;
+    editSuccess.value = null;
+  
+    try {
+      const payload: any = {};
+      if (editTitle.value.trim().length > 0) payload.title = editTitle.value.trim();
+      if (editBody.value.trim().length > 0) payload.body = editBody.value.trim();
+      if (editMinRole.value) payload.min_role = editMinRole.value;
+  
+      if (!payload.title && !payload.body && !payload.min_role) {
+        editError.value = "Нечего сохранять";
+        savingEdit.value = false;
+        return;
+      }
+  
+      await updateNote(userId.value, noteId, payload);
+      editSuccess.value = "Заметка обновлена";
+  
+      // обновляем список заметок
+      const notesRes = await listNotes(userId.value);
+      notes.value = notesRes.notes || [];
+  
+      // сбрасываем режим редактирования
+      cancelEdit();
+    } catch (e: any) {
+      editError.value = e.message || String(e);
+    } finally {
+      savingEdit.value = false;
     }
   }
 </script>
@@ -298,6 +413,15 @@
     margin-top: 2px;
   }
   
+  .btn--small {
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+  
+  .btn--secondary {
+    background: #4b5563;
+  }
+  
   .loading {
     margin-left: 8px;
     font-size: 12px;
@@ -350,10 +474,26 @@
     justify-content: space-between;
     align-items: center;
     margin-bottom: 4px;
+    gap: 8px;
   }
   
   .note__title {
     font-weight: 600;
+    flex: 1;
+  }
+  
+  .note__title input {
+    width: 100%;
+    padding: 4px 6px;
+    font-size: 13px;
+  }
+  
+  .min-role-select {
+    font-size: 11px;
+    padding: 2px 4px;
+    border-radius: 999px;
+    border: 1px solid #d1d5db;
+    background: #f9fafb;
   }
   
   .note__meta {
@@ -366,6 +506,21 @@
   
   .note__body {
     white-space: pre-wrap;
+  }
+  
+  .note__body textarea {
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid #d1d5db;
+    font-size: 13px;
+    white-space: pre-wrap;
+  }
+  
+  .note__actions {
+    margin-top: 6px;
+    display: flex;
+    gap: 6px;
   }
 </style>
   
