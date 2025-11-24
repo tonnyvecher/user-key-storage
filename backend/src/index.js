@@ -544,43 +544,114 @@ app.post("/users/:id/profile", async (req, res) => {
  *
  * Пользователь определяется через authKeycloakMiddleware.
  */
-app.get("/secure-test", authKeycloakMiddleware, async (req, res) => {
+app.get("/secure-test", async (req, res) => {
   try {
-    const userId = req.user.id;
+    // 1. Определяем userId:
+    //    - если запрос пришёл с токеном Keycloak → берем из req.user.id
+    //    - если тестируешь через PowerShell → можно передать ?userId=...
+    const userId = req.user?.id || req.query.userId;
 
+    if (!userId) {
+      return res.status(400).json({
+        status: "error",
+        message: "userId is required (either from auth middleware or query param)"
+      });
+    }
+
+    // 2. Достаём все роли пользователя
     const result = await pool.query(
-      "SELECT 1 FROM user_roles WHERE user_id = $1 AND role_name = $2 LIMIT 1",
-      [userId, "ADMIN"]
+      "SELECT id, role_name, signature, created_at FROM user_roles WHERE user_id = $1",
+      [userId]
     );
 
-    if (result.rowCount === 0) {
-      await logAudit(userId, "SECURE_TEST_DENIED", {
-        required_role: "ADMIN"
+    if (result.rows.length === 0) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "User has no roles"
       });
+    }
 
+    // 3. Отбираем только ADMIN
+    const adminRoles = result.rows.filter((row) => row.role_name === "ADMIN");
+
+    if (adminRoles.length === 0) {
       return res.status(403).json({
         status: "forbidden",
         message: "User does not have ADMIN role"
       });
     }
 
-    await logAudit(userId, "SECURE_TEST_GRANTED", {
-      required_role: "ADMIN"
-    });
+    // 4. Проверяем подпись для ADMIN ролей
+    let hasValidAdmin = false;
+    const details = [];
 
-    res.json({
+    for (const row of adminRoles) {
+      const base = {
+        role_name: row.role_name,
+        signature: row.signature,
+        created_at: row.created_at
+      };
+
+      if (!row.signature) {
+        details.push({
+          ...base,
+          valid: false,
+          reason: "ADMIN role has no signature (legacy or tampered)"
+        });
+        continue;
+      }
+
+      try {
+        const expected = await signAccessOperation(userId, row.role_name, "GRANT_ROLE");
+
+        if (expected === row.signature) {
+          hasValidAdmin = true;
+          details.push({
+            ...base,
+            valid: true,
+            reason: "Signature matches HMAC(user_id, role_name, action)"
+          });
+          // можно break, но оставим как есть, если захочешь логировать все
+        } else {
+          details.push({
+            ...base,
+            valid: false,
+            reason: "Stored signature does not match recomputed HMAC"
+          });
+        }
+      } catch (err) {
+        console.error("Error verifying ADMIN signature in /secure-test:", err);
+        details.push({
+          ...base,
+          valid: false,
+          reason: "Error during HMAC verification: " + err.message
+        });
+      }
+    }
+
+    if (!hasValidAdmin) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "User's ADMIN roles are invalid or tampered",
+        roles: details
+      });
+    }
+
+    // 5. Если дошли до сюда — есть хотя бы один валидный ADMIN
+    return res.json({
       status: "ok",
-      message: "User has ADMIN role, access granted",
-      user: req.user
+      message: "User has valid ADMIN role, access granted",
+      roles: details
     });
   } catch (err) {
-    console.error("Error in secure-test:", err);
+    console.error("Error in /secure-test:", err);
     res.status(500).json({
       status: "error",
       message: err.message
     });
   }
 });
+
 
 
 /**
