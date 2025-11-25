@@ -1,5 +1,6 @@
 <template>
-  <div class="layout">
+  <LoginView class='login-view' v-if="!isAuthenticated" />
+  <div v-else class="layout">
     <header class="layout__header">
       <div class="layout__brand">
         <div class="layout__title">User Key Storage</div>
@@ -61,6 +62,7 @@
 import { RouterLink, RouterView } from "vue-router";
 import { computed } from "vue";
 import { authState, login, logout } from "./auth";
+import LoginView from "./views/LoginView.vue";
 
 const isAuthenticated = computed(() => authState.authenticated);
 const isAuthLoading = computed(

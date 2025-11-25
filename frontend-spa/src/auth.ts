@@ -30,7 +30,7 @@ export async function initAuth() {
 
   try {
     const authenticated = await keycloak.init({
-      onLoad: 'login-required', // если есть сессия — подхватит, если нет — просто гость
+      onLoad: 'check-sso', // login-required - жесткий режим, check-sso - мягкий режим
       pkceMethod: 'S256',
       checkLoginIframe: false
     });
