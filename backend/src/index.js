@@ -4,8 +4,48 @@ const { logAudit } = require("./audit");
 const { authKeycloakMiddleware } = require("./authMiddleware");
 const { encryptField, decryptField, signAccessOperation, rotateMasterKey } = require("./cryptoClient");
 
+// --------- Role hierarchy for notes access ---------
+const ROLE_RANK = {
+  USER: 1,
+  MANAGER: 2,
+  ADMIN: 3,
+  SUPERADMIN: 4,
+  OWNER: 5
+};
+
+function getRoleRank(roleName) {
+  if (!roleName) return 0;
+  const upper = String(roleName).toUpperCase();
+  return ROLE_RANK[upper] || 0;
+}
+
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Получаем максимальный уровень роли пользователя с учётом проверки подписи через /users/:id/roles/verify
+async function getUserMaxRoleRank(userId) {
+  try {
+    const verifyRes = await fetch(`http://localhost:${port}/users/${userId}/roles/verify`);
+    if (!verifyRes.ok) {
+      console.error("getUserMaxRoleRank: verify endpoint returned", verifyRes.status);
+      return 0;
+    }
+    const data = await verifyRes.json();
+    const roles = data.roles || [];
+
+    let maxRank = 0;
+    for (const r of roles) {
+      if (r.valid) {
+        const rank = getRoleRank(r.role_name);
+        if (rank > maxRank) maxRank = rank;
+      }
+    }
+    return maxRank;
+  } catch (e) {
+    console.error("getUserMaxRoleRank error:", e);
+    return 0;
+  }
+}
 
 app.use(express.json());
 
@@ -665,19 +705,98 @@ app.get("/secure-test", async (req, res) => {
  *  - находим или создаём user + external_account;
  *  - возвращаем информацию о внутреннем пользователе.
  */
-app.post("/auth/keycloak", authKeycloakMiddleware, (req, res) => {
-  const { payload, created } = req.auth;
+app.post("/auth/keycloak", authKeycloakMiddleware, async (req, res) => {
+  try {
+    const { payload, created } = req.auth;
+    const user = req.user;
 
-  res.json({
-    status: "ok",
-    source: "keycloak",
-    created,
-    user: req.user,
-    token_info: {
-      sub: payload.sub,
-      email: payload.email || null
+    if (!user || !user.id) {
+      return res.status(500).json({
+        status: "error",
+        message: "Internal error: user not resolved after Keycloak auth"
+      });
     }
-  });
+
+    const userId = user.id;
+
+    // 1) Собираем full_name из токена Keycloak
+    const givenName = payload.given_name || "";
+    const familyName = payload.family_name || "";
+    const preferred = payload.preferred_username || "";
+    const email = payload.email || "";
+
+    let fullName = "";
+    if (givenName || familyName) {
+      fullName = `${givenName} ${familyName}`.trim();
+    } else if (preferred) {
+      fullName = preferred;
+    } else if (email) {
+      fullName = email;
+    }
+
+    // 2) Обновляем/создаём профиль с full_name (без телефона/даты рождения)
+    if (fullName) {
+      await pool.query(
+        `
+        INSERT INTO profiles (user_id, full_name)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id)
+          DO UPDATE SET full_name = EXCLUDED.full_name, updated_at = now()
+        `,
+        [userId, fullName]
+      );
+    }
+
+    // 3) Автоматически выдаём роль USER при первом логине
+    const baseRoleName = "USER";
+    const roleCheck = await pool.query(
+      "SELECT 1 FROM user_roles WHERE user_id = $1 AND role_name = $2",
+      [userId, baseRoleName]
+    );
+
+    if (roleCheck.rowCount === 0) {
+      try {
+        // используем уже рабочую функцию, которая дергает обёртку
+        const signature = await signAccessOperation(userId, baseRoleName, "GRANT_ROLE");
+
+        await pool.query(
+          "INSERT INTO user_roles (user_id, role_name, signature) VALUES ($1, $2, $3)",
+          [userId, baseRoleName, signature]
+        );
+
+        // лог пишем через audit_logs (можно и через logAudit, как тебе удобнее)
+        await pool.query(
+          "INSERT INTO audit_logs (user_id, action, meta) VALUES ($1, $2, $3)",
+          [
+            userId,
+            "ROLE_ASSIGNED_AUTO",
+            JSON.stringify({ role_name: baseRoleName, from: "keycloak_login" })
+          ]
+        );
+      } catch (e) {
+        console.error("Assign default USER role error:", e);
+        // пользователя не валим, просто пишем в лог
+      }
+    }
+
+    // 4) Возвращаем ответ фронту, как и раньше
+    res.json({
+      status: "ok",
+      source: "keycloak",
+      created,
+      user,
+      token_info: {
+        sub: payload.sub,
+        email: payload.email || null
+      }
+    });
+  } catch (err) {
+    console.error("Error in /auth/keycloak:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
 });
 
 // Админ-эндпоинт для ротации мастер-ключа профиля.
@@ -691,6 +810,343 @@ app.post("/admin/rotate-master", async (req, res) => {
     });
   } catch (err) {
     console.error("Error rotating master key:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// -------- ADMIN: статус пользователей и целостность ролей --------
+app.get("/admin/users/status", async (req, res) => {
+  try {
+    // 1. Берём всех пользователей из БД
+    const usersRes = await pool.query(
+      "SELECT id, primary_email, is_active, created_at FROM users ORDER BY created_at DESC"
+    );
+    const users = usersRes.rows;
+
+    const results = [];
+
+    // 2. Для каждого пользователя дергаем уже существующий эндпоинт /users/:id/roles/verify
+    for (const u of users) {
+      let rolesCount = 0;
+      let hasIssues = false;
+
+      try {
+        const verifyRes = await fetch(
+          `http://localhost:${port}/users/${u.id}/roles/verify`
+        );
+
+        if (verifyRes.ok) {
+          const data = await verifyRes.json();
+          const roles = data.roles || [];
+          rolesCount = data.count ?? roles.length;
+          // есть ли хотя бы одна роль с проблемой (valid === false)
+          hasIssues = roles.some((r) => r.valid === false);
+        } else {
+          // если сам запрос /roles/verify вернул ошибку — считаем, что есть проблемы
+          hasIssues = true;
+        }
+      } catch (e) {
+        console.error("Error checking roles for user", u.id, e);
+        hasIssues = true;
+      }
+
+      results.push({
+        id: u.id,
+        primary_email: u.primary_email,
+        is_active: u.is_active,
+        created_at: u.created_at,
+        roles_count: rolesCount,
+        has_issues: hasIssues
+      });
+    }
+
+    res.json({
+      status: "ok",
+      count: results.length,
+      users: results
+    });
+  } catch (err) {
+    console.error("Error in /admin/users/status:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// -------- NOTES: доступ по ролям --------
+
+// Список заметок, доступных пользователю (по его максимальной роли)
+app.get("/notes", async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) {
+    return res.status(400).json({
+      status: "error",
+      message: "userId query param is required"
+    });
+  }
+
+  try {
+    const userRank = await getUserMaxRoleRank(userId);
+
+    const result = await pool.query(
+      "SELECT id, owner_user_id, title, body, min_role, created_at, updated_at FROM notes ORDER BY created_at DESC"
+    );
+
+    const visibleNotes = result.rows.filter((note) => {
+      const requiredRank = getRoleRank(note.min_role);
+      // Пользователь может читать заметку, если его ранг >= требуемого
+      return userRank >= requiredRank;
+    });
+
+    res.json({
+      status: "ok",
+      user_id: userId,
+      user_max_role_rank: userRank,
+      count: visibleNotes.length,
+      notes: visibleNotes
+    });
+  } catch (err) {
+    console.error("Error in GET /notes:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// Создание заметки. Создавать можно только в пределах своей максимальной роли.
+app.post("/notes", async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) {
+    return res.status(400).json({
+      status: "error",
+      message: "userId query param is required"
+    });
+  }
+
+  const { title, body, min_role } = req.body || {};
+
+  if (!title || !body || !min_role) {
+    return res.status(400).json({
+      status: "error",
+      message: "title, body and min_role are required"
+    });
+  }
+
+  const normalizedRole = String(min_role).toUpperCase();
+  const requiredRank = getRoleRank(normalizedRole);
+
+  if (requiredRank === 0) {
+    return res.status(400).json({
+      status: "error",
+      message: `Unknown min_role: ${min_role}`
+    });
+  }
+
+  try {
+    const userRank = await getUserMaxRoleRank(userId);
+
+    if (userRank === 0) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "User has no valid roles for note creation"
+      });
+    }
+
+    if (requiredRank > userRank) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: `You cannot create a note with min_role ${normalizedRole} higher than your max role`
+      });
+    }
+
+    const insertRes = await pool.query(
+      `INSERT INTO notes (owner_user_id, title, body, min_role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, owner_user_id, title, body, min_role, created_at, updated_at`,
+      [userId, title, body, normalizedRole]
+    );
+
+    res.status(201).json({
+      status: "ok",
+      note: insertRes.rows[0]
+    });
+  } catch (err) {
+    console.error("Error in POST /notes:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.get("/notes/:id", async (req, res) => {
+  const userId = req.query.userId;
+  const noteId = req.params.id;
+
+  if (!userId) {
+    return res.status(400).json({
+      status: "error",
+      message: "userId query param is required"
+    });
+  }
+
+  try {
+    const noteRes = await pool.query(
+      "SELECT id, owner_user_id, title, body, min_role, created_at, updated_at FROM notes WHERE id = $1",
+      [noteId]
+    );
+
+    if (noteRes.rowCount === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Note not found"
+      });
+    }
+
+    const note = noteRes.rows[0];
+    const requiredRank = getRoleRank(note.min_role);
+    const userRank = await getUserMaxRoleRank(userId);
+
+    if (userRank < requiredRank) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "Insufficient role to read this note"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      note
+    });
+  } catch (err) {
+    console.error("Error in GET /notes/:id:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// Обновление заметки: только владелец, внутри своей максимальной роли
+app.put("/notes/:id", async (req, res) => {
+  const userId = req.query.userId;
+  const noteId = req.params.id;
+
+  if (!userId) {
+    return res.status(400).json({
+      status: "error",
+      message: "userId query param is required"
+    });
+  }
+
+  const { title, body, min_role } = req.body || {};
+
+  if (!title && !body && !min_role) {
+    return res.status(400).json({
+      status: "error",
+      message: "At least one of title, body or min_role must be provided"
+    });
+  }
+
+  try {
+    // 1. Читаем заметку
+    const noteRes = await pool.query(
+      "SELECT id, owner_user_id, title, body, min_role, created_at, updated_at FROM notes WHERE id = $1",
+      [noteId]
+    );
+
+    if (noteRes.rowCount === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Note not found"
+      });
+    }
+
+    const note = noteRes.rows[0];
+
+    // 2. Проверяем, что пользователь — владелец
+    if (String(note.owner_user_id) !== String(userId)) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "Only owner can edit this note"
+      });
+    }
+
+    // 3. Проверяем, что его максимальная роль >= текущего min_role заметки
+    const userRank = await getUserMaxRoleRank(userId);
+    const currentRequiredRank = getRoleRank(note.min_role);
+
+    if (userRank < currentRequiredRank) {
+      return res.status(403).json({
+        status: "forbidden",
+        message: "Your max role is not enough to edit this note"
+      });
+    }
+
+    // 4. Если меняем min_role — проверяем, что новая роль не выше max роли пользователя
+    let newMinRole = note.min_role;
+    if (min_role) {
+      const normalizedRole = String(min_role).toUpperCase();
+      const newRank = getRoleRank(normalizedRole);
+
+      if (newRank === 0) {
+        return res.status(400).json({
+          status: "error",
+          message: `Unknown min_role: ${min_role}`
+        });
+      }
+
+      if (newRank > userRank) {
+        return res.status(403).json({
+          status: "forbidden",
+          message: `You cannot set min_role ${normalizedRole} higher than your max role`
+        });
+      }
+
+      newMinRole = normalizedRole;
+    }
+
+    // 5. Формируем динамический UPDATE (обновляем только то, что реально передали)
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    if (title) {
+      fields.push(`title = $${idx++}`);
+      values.push(title);
+    }
+    if (body) {
+      fields.push(`body = $${idx++}`);
+      values.push(body);
+    }
+    if (min_role) {
+      fields.push(`min_role = $${idx++}`);
+      values.push(newMinRole);
+    }
+
+    fields.push(`updated_at = now()`);
+
+    const updateQuery = `
+      UPDATE notes
+      SET ${fields.join(", ")}
+      WHERE id = $${idx}
+      RETURNING id, owner_user_id, title, body, min_role, created_at, updated_at
+    `;
+    values.push(noteId);
+
+    const updateRes = await pool.query(updateQuery, values);
+
+    res.json({
+      status: "ok",
+      note: updateRes.rows[0]
+    });
+  } catch (err) {
+    console.error("Error in PUT /notes/:id:", err);
     res.status(500).json({
       status: "error",
       message: err.message
