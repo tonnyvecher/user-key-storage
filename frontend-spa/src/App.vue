@@ -1,6 +1,5 @@
 <template>
-  <LoginView class='login-view' v-if="!isAuthenticated" />
-  <div v-else class="layout">
+  <div class="layout">
     <header class="layout__header">
       <div class="layout__brand">
         <div class="layout__title">User Key Storage</div>
@@ -8,7 +7,7 @@
           Дипломная система хранения ключевой информации
         </div>
       </div>
-      <nav class="layout__nav">
+      <nav class="layout__nav" v-if="isAuthenticated">
         <RouterLink
           to="/"
           class="nav-link"
@@ -44,16 +43,14 @@
               Выйти
             </button>
           </template>
-
-          <button v-else class="auth-btn" @click="login">
-            Войти через Keycloak
-          </button>
         </template>
       </div>
     </header>
 
     <main class="layout__main">
-      <RouterView />
+      <LoginView v-if="!isAuthenticated" />
+
+      <RouterView v-else />
     </main>
   </div>
 </template>
