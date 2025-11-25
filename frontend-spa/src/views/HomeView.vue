@@ -57,12 +57,28 @@
 
     <section class="grid">
       <div class="card">
-        <h2 class="card__title">Профиль</h2>
+        <div class="card__header-row">
+          <h2 class="card__title">Профиль</h2>
+          <!-- Кнопка редактирования только для текущего залогиненного пользователя -->
+          <button
+            v-if="
+              myUserId &&
+              userId === myUserId &&
+              profileData &&
+              profileData.profile
+            "
+            type="button"
+            class="mini-btn mini-btn--primary"
+            @click="openEditMyProfile"
+          >
+            Редактировать мой профиль
+          </button>
+        </div>
         <p class="hint">
           Чувствительные поля (телефон / дата рождения) хранятся в БД в
           зашифрованном виде, а здесь уже отображаются расшифрованные значения.
         </p>
-        <div v-if="profileData">
+        <div v-if="profileData && profileData.profile">
           <div class="profile">
             <div>
               <strong>Имя:</strong> {{ profileData.profile?.full_name || "—" }}
@@ -132,54 +148,56 @@
       <div v-else class="empty">/secure-test ещё не вызывался.</div>
     </section>
 
-    <section class="card">
-      <h2 class="card__title">Мой профиль (редактирование)</h2>
-      <p class="hint">
-        Здесь вы можете заполнить или обновить свои данные профиля. Телефон и
-        дата рождения будут сохранены в БД в зашифрованном виде, а при чтении
-        расшифровываться через Java-обёртку и Vault.
-      </p>
+    <!-- Модалка редактирования моего профиля -->
+    <div v-if="editMyProfileOpen" class="modal">
+      <div class="modal__backdrop" @click="closeEditMyProfile"></div>
+      <div class="modal__content">
+        <h3 class="modal__title">Редактирование профиля</h3>
+        <p class="hint">
+          Здесь можно обновить только телефон и дату рождения. Имя берётся из
+          Keycloak и изменяется через учётную запись в Keycloak.
+        </p>
 
-      <div v-if="!myUserId" class="error">
-        Сначала войдите через Keycloak, чтобы редактировать свой профиль.
+        <div class="field">
+          <label for="editPhone">Телефон:</label>
+          <input id="editPhone" v-model="editPhone" placeholder="+7999..." />
+        </div>
+
+        <div class="field">
+          <label for="editBirth">Дата рождения (YYYY-MM-DD):</label>
+          <input
+            id="editBirth"
+            v-model="editBirthDate"
+            placeholder="1990-01-01"
+          />
+        </div>
+
+        <div class="modal__buttons">
+          <button
+            type="button"
+            @click="saveEditMyProfile"
+            :disabled="profileEditLoading"
+          >
+            Сохранить
+          </button>
+          <button
+            type="button"
+            class="secondary"
+            @click="closeEditMyProfile"
+            :disabled="profileEditLoading"
+          >
+            Отмена
+          </button>
+        </div>
+
+        <div v-if="profileEditError" class="error">
+          {{ profileEditError }}
+        </div>
+        <div v-if="profileEditSuccess" class="success">
+          {{ profileEditSuccess }}
+        </div>
       </div>
-
-      <div v-else>
-        <div class="field">
-          <label for="myFullName">Имя (full_name):</label>
-          <input id="myFullName" v-model="profileFormFullName" />
-        </div>
-
-        <div class="field">
-          <label for="myPhone">Телефон:</label>
-          <input id="myPhone" v-model="profileFormPhone" />
-        </div>
-
-        <div class="field">
-          <label for="myBirth">Дата рождения (YYYY-MM-DD):</label>
-          <input id="myBirth" v-model="profileFormBirthDate" />
-        </div>
-
-        <div class="field">
-          <label for="myLang">Язык интерфейса:</label>
-          <input id="myLang" v-model="profileFormLang" />
-        </div>
-
-        <div class="field">
-          <label for="myTheme">Тема:</label>
-          <input id="myTheme" v-model="profileFormTheme" />
-        </div>
-
-        <button @click="saveMyProfile" :disabled="profileFormLoading">
-          Сохранить мой профиль
-        </button>
-
-        <div v-if="profileFormError" class="error">{{ profileFormError }}</div>
-        <div v-if="profileFormSuccess" class="success">
-          {{ profileFormSuccess }}
-        </div>
-      </div>
-    </section>
+    </div>
   </div>
 </template>
 
@@ -199,15 +217,13 @@ const loading = ref(false);
 
 const myUserId = computed(() => authState.internalUserId);
 
-const profileFormFullName = ref("");
-const profileFormPhone = ref("");
-const profileFormBirthDate = ref("");
-const profileFormLang = ref("ru");
-const profileFormTheme = ref("light");
-
-const profileFormLoading = ref(false);
-const profileFormError = ref<string | null>(null);
-const profileFormSuccess = ref<string | null>(null);
+// --- состояние модалки редактирования профиля текущего пользователя ---
+const editMyProfileOpen = ref(false);
+const editPhone = ref("");
+const editBirthDate = ref("");
+const profileEditLoading = ref(false);
+const profileEditError = ref<string | null>(null);
+const profileEditSuccess = ref<string | null>(null);
 
 async function loadProfile() {
   if (!userId.value) return;
@@ -256,46 +272,66 @@ async function runSecureTest() {
   }
 }
 
-async function saveMyProfile() {
-  if (!myUserId.value) {
-    profileFormError.value = "Сначала авторизуйтесь через Keycloak";
-    return;
-  }
-
-  profileFormLoading.value = true;
-  profileFormError.value = null;
-  profileFormSuccess.value = null;
-
-  try {
-    const payload = {
-      full_name: profileFormFullName.value || null,
-      phone: profileFormPhone.value || null,
-      birth_date: profileFormBirthDate.value || null,
-      settings: {
-        lang: profileFormLang.value || "ru",
-        theme: profileFormTheme.value || "light",
-      },
-    };
-
-    const data = await upsertProfile(myUserId.value, payload);
-    profileFormSuccess.value = "Профиль успешно сохранён.";
-
-    // можно заодно обновить diagnostics, если myUserId совпадает с введённым userId
-    if (userId.value === myUserId.value) {
-      profileData.value = data;
-      profileRaw.value = JSON.stringify(data, null, 2);
-    }
-  } catch (e: any) {
-    profileFormError.value = e.message || String(e);
-  } finally {
-    profileFormLoading.value = false;
-  }
-}
-
 async function loadAll() {
   await loadProfile();
   await loadRoles();
   await runSecureTest();
+}
+
+// --- модалка редактирования профиля ---
+function openEditMyProfile() {
+  if (!myUserId.value) return;
+
+  const currentProfile = profileData.value?.profile || null;
+  editPhone.value = currentProfile?.phone || "";
+  editBirthDate.value = currentProfile?.birth_date || "";
+
+  profileEditError.value = null;
+  profileEditSuccess.value = null;
+  editMyProfileOpen.value = true;
+}
+
+function closeEditMyProfile() {
+  if (profileEditLoading.value) return;
+  editMyProfileOpen.value = false;
+}
+
+async function saveEditMyProfile() {
+  if (!myUserId.value) {
+    profileEditError.value = "Сначала авторизуйтесь через Keycloak.";
+    return;
+  }
+
+  const currentProfile = profileData.value?.profile || {};
+
+  const payload = {
+    // full_name НЕ меняем с фронта: берём текущее значение,
+    // чтобы не затирать его null'ом.
+    full_name: currentProfile.full_name ?? null,
+    phone: editPhone.value || null,
+    birth_date: editBirthDate.value || null,
+    // настройки тоже не трогаем с UI — просто прокидываем как есть
+    settings: currentProfile.settings ?? null,
+  };
+
+  profileEditLoading.value = true;
+  profileEditError.value = null;
+  profileEditSuccess.value = null;
+
+  try {
+    const data = await upsertProfile(myUserId.value, payload);
+
+    // обновляем локальное состояние профиля / JSON
+    profileData.value = data;
+    profileRaw.value = JSON.stringify(data, null, 2);
+
+    profileEditSuccess.value = "Профиль успешно обновлён.";
+    editMyProfileOpen.value = false;
+  } catch (e: any) {
+    profileEditError.value = e.message || String(e);
+  } finally {
+    profileEditLoading.value = false;
+  }
 }
 </script>
 
@@ -326,6 +362,14 @@ async function loadAll() {
 .card__title {
   margin: 0 0 8px;
   font-size: 16px;
+}
+
+.card__header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
 }
 
 .field {
@@ -375,6 +419,12 @@ button:disabled {
 .error {
   font-size: 13px;
   color: #b91c1c;
+}
+
+.success {
+  font-size: 13px;
+  color: #15803d;
+  margin-top: 4px;
 }
 
 .hint {
@@ -480,9 +530,46 @@ pre {
   background: #e5e7eb;
 }
 
-.success {
-  font-size: 13px;
-  color: #15803d;
-  margin-top: 6px;
+.mini-btn--primary {
+  background: #2563eb;
+  color: #ffffff;
+}
+
+/* --- модалка --- */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+}
+
+.modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.modal__content {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  max-width: 420px;
+  max-height: 320px;
+  background: #ffffff;
+  border-radius: 12px;
+  padding: 16px 18px;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.25);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal__title {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.modal__buttons {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
 }
 </style>
