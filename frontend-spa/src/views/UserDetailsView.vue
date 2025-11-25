@@ -1,18 +1,33 @@
 <template>
   <div>
     <div class="card">
-      <h2 class="card__title">
-        {{ isSelf ? "Ваш профиль" : "Профиль пользователя" }}
-      </h2>
+      <div class="card__header-row">
+        <h2 class="card__title">
+          {{ isSelf ? "Ваш профиль" : "Профиль пользователя" }}
+        </h2>
+
+        <!-- Кнопка редактирования только для самого себя -->
+        <button
+          v-if="isSelf"
+          class="mini-btn mini-btn--primary"
+          type="button"
+          @click="openEditProfile"
+        >
+          Редактировать профиль
+        </button>
+      </div>
+
       <p class="hint">
         Это личный кабинет пользователя. Здесь показываются его профиль, роли и
         результат проверки доступа через
         <code>/secure-test</code>.
       </p>
+
       <div class="info-row">
         <span class="info-label">userId:</span>
         <span class="info-value mono">{{ userId }}</span>
       </div>
+
       <button class="btn" @click="loadAll" :disabled="loading">
         Обновить данные
       </button>
@@ -79,21 +94,70 @@
     <section class="card">
       <h3 class="card__title">Результат /secure-test</h3>
       <pre v-if="secureTestRaw">{{ secureTestRaw }}</pre>
-      <div v-else class="empty">/secure-test ещё не вызывался.</div>
+      <div class="empty" v-else>/secure-test ещё не вызывался.</div>
     </section>
+
+    <!-- МОДАЛКА РЕДАКТИРОВАНИЯ ПРОФИЛЯ (только для isSelf) -->
+    <div v-if="editProfileOpen" class="modal">
+      <div class="modal__backdrop" @click="closeEditProfile"></div>
+      <div class="modal__content">
+        <h3 class="modal__title">Редактирование профиля</h3>
+        <p class="hint">
+          Здесь можно обновить только телефон и дату рождения. Имя берётся из
+          Keycloak и изменяется через учётную запись в Keycloak.
+        </p>
+
+        <div class="field">
+          <label for="editPhone">Телефон:</label>
+          <input id="editPhone" v-model="editPhone" placeholder="+7999..." />
+        </div>
+
+        <div class="field">
+          <label for="editBirth">Дата рождения (YYYY-MM-DD):</label>
+          <input
+            id="editBirth"
+            v-model="editBirthDate"
+            placeholder="1990-01-01"
+          />
+        </div>
+
+        <div class="modal__buttons">
+          <button
+            type="button"
+            @click="saveEditProfile"
+            :disabled="profileEditLoading"
+          >
+            Сохранить
+          </button>
+          <button
+            type="button"
+            class="secondary"
+            @click="closeEditProfile"
+            :disabled="profileEditLoading"
+          >
+            Отмена
+          </button>
+        </div>
+
+        <div v-if="profileEditError" class="error">
+          {{ profileEditError }}
+        </div>
+        <div v-if="profileEditSuccess" class="success">
+          {{ profileEditSuccess }}
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { getProfile, getRolesVerify, secureTest } from "../api";
+import { getProfile, getRolesVerify, secureTest, upsertProfile } from "../api";
 import { authState } from "../auth";
 
 const route = useRoute();
 const userId = computed(() => route.params.id as string);
-
-const shortId = computed(() => userId.value?.slice(0, 8) + "..." || "");
 
 const profileData = ref<any | null>(null);
 const profileRaw = ref<string | null>(null);
@@ -102,6 +166,16 @@ const rolesRaw = ref<string | null>(null);
 const secureTestRaw = ref<string | null>(null);
 const error = ref<string | null>(null);
 const loading = ref(false);
+
+const isSelf = computed(() => authState.internalUserId === route.params.id);
+
+// --- состояние модалки редактирования ---
+const editProfileOpen = ref(false);
+const editPhone = ref("");
+const editBirthDate = ref("");
+const profileEditLoading = ref(false);
+const profileEditError = ref<string | null>(null);
+const profileEditSuccess = ref<string | null>(null);
 
 async function loadProfile() {
   if (!userId.value) return;
@@ -138,7 +212,56 @@ async function loadAll() {
   }
 }
 
-const isSelf = computed(() => authState.internalUserId === route.params.id);
+// ---- модалка ----
+function openEditProfile() {
+  if (!isSelf.value) return;
+
+  const currentProfile = profileData.value?.profile || null;
+  editPhone.value = currentProfile?.phone || "";
+  editBirthDate.value = currentProfile?.birth_date || "";
+
+  profileEditError.value = null;
+  profileEditSuccess.value = null;
+  editProfileOpen.value = true;
+}
+
+function closeEditProfile() {
+  if (profileEditLoading.value) return;
+  editProfileOpen.value = false;
+}
+
+async function saveEditProfile() {
+  if (!isSelf.value || !userId.value) {
+    profileEditError.value = "Редактировать профиль можно только для себя.";
+    return;
+  }
+
+  const currentProfile = profileData.value?.profile || {};
+
+  const payload = {
+    // full_name не меняем с фронта — берём текущее значение
+    full_name: currentProfile.full_name ?? null,
+    phone: editPhone.value || null,
+    birth_date: editBirthDate.value || null,
+    settings: currentProfile.settings ?? null,
+  };
+
+  profileEditLoading.value = true;
+  profileEditError.value = null;
+  profileEditSuccess.value = null;
+
+  try {
+    const data = await upsertProfile(userId.value, payload);
+    profileData.value = data;
+    profileRaw.value = JSON.stringify(data, null, 2);
+    profileEditSuccess.value = "Профиль успешно обновлён.";
+    editProfileOpen.value = false;
+  } catch (e: any) {
+    profileEditError.value = e.message || String(e);
+  } finally {
+    profileEditLoading.value = false;
+  }
+}
 
 onMounted(loadAll);
 
@@ -163,6 +286,14 @@ watch(userId, () => {
 .card__title {
   margin: 0 0 8px;
   font-size: 16px;
+}
+
+.card__header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
 }
 
 .hint {
@@ -208,6 +339,12 @@ watch(userId, () => {
   font-size: 13px;
   color: #b91c1c;
   margin-top: 8px;
+}
+
+.success {
+  font-size: 13px;
+  color: #15803d;
+  margin-top: 4px;
 }
 
 .grid {
@@ -291,5 +428,75 @@ pre {
   font-size: 11px;
   overflow-x: auto;
   margin-top: 8px;
+}
+
+.mini-btn {
+  padding: 4px 8px;
+  font-size: 11px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  background: #e5e7eb;
+}
+
+.mini-btn--primary {
+  background: #2563eb;
+  color: #ffffff;
+}
+
+/* модалка */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+}
+
+.modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.modal__content {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  max-width: 420px;
+  max-height: 320px;
+  background: #ffffff;
+  border-radius: 12px;
+  padding: 16px 18px;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.25);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal__title {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.modal__buttons {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.field {
+  margin-bottom: 10px;
+}
+
+.field label {
+  display: block;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.field input {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  font-size: 14px;
 }
 </style>
