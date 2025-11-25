@@ -27,14 +27,25 @@
         <span v-if="isAuthLoading" class="auth-text">Auth...</span>
 
         <template v-else>
-          <span v-if="isAuthenticated" class="auth-text">
-            {{ userEmail || "Пользователь Keycloak" }}
-          </span>
-          <button v-if="!isAuthenticated" class="auth-btn" @click="login">
+          <template v-if="isAuthenticated">
+            <RouterLink
+              v-if="internalUserId"
+              :to="{ name: 'user-details', params: { id: internalUserId } }"
+              class="auth-link"
+            >
+              {{ userEmail || "Пользователь Keycloak" }}
+            </RouterLink>
+            <span v-else class="auth-text">
+              {{ userEmail || "Пользователь Keycloak" }}
+            </span>
+
+            <button class="auth-btn auth-btn--secondary" @click="logout">
+              Выйти
+            </button>
+          </template>
+
+          <button v-else class="auth-btn" @click="login">
             Войти через Keycloak
-          </button>
-          <button v-else class="auth-btn auth-btn--secondary" @click="logout">
-            Выйти
           </button>
         </template>
       </div>
@@ -59,6 +70,8 @@ const userEmail = computed(
   () =>
     authState.tokenParsed?.email || authState.internalUser?.primary_email || ""
 );
+
+const internalUserId = computed(() => authState.internalUserId);
 </script>
 
 <style scoped>
@@ -144,5 +157,15 @@ const userEmail = computed(
 
 .auth-btn--secondary {
   background: #4b5563;
+}
+
+.auth-link {
+  font-size: 12px;
+  color: #bfdbfe;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.auth-link:hover {
+  color: #ffffff;
 }
 </style>
