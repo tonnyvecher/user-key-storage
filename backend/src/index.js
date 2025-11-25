@@ -705,19 +705,98 @@ app.get("/secure-test", async (req, res) => {
  *  - находим или создаём user + external_account;
  *  - возвращаем информацию о внутреннем пользователе.
  */
-app.post("/auth/keycloak", authKeycloakMiddleware, (req, res) => {
-  const { payload, created } = req.auth;
+app.post("/auth/keycloak", authKeycloakMiddleware, async (req, res) => {
+  try {
+    const { payload, created } = req.auth;
+    const user = req.user;
 
-  res.json({
-    status: "ok",
-    source: "keycloak",
-    created,
-    user: req.user,
-    token_info: {
-      sub: payload.sub,
-      email: payload.email || null
+    if (!user || !user.id) {
+      return res.status(500).json({
+        status: "error",
+        message: "Internal error: user not resolved after Keycloak auth"
+      });
     }
-  });
+
+    const userId = user.id;
+
+    // 1) Собираем full_name из токена Keycloak
+    const givenName = payload.given_name || "";
+    const familyName = payload.family_name || "";
+    const preferred = payload.preferred_username || "";
+    const email = payload.email || "";
+
+    let fullName = "";
+    if (givenName || familyName) {
+      fullName = `${givenName} ${familyName}`.trim();
+    } else if (preferred) {
+      fullName = preferred;
+    } else if (email) {
+      fullName = email;
+    }
+
+    // 2) Обновляем/создаём профиль с full_name (без телефона/даты рождения)
+    if (fullName) {
+      await pool.query(
+        `
+        INSERT INTO profiles (user_id, full_name)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id)
+          DO UPDATE SET full_name = EXCLUDED.full_name, updated_at = now()
+        `,
+        [userId, fullName]
+      );
+    }
+
+    // 3) Автоматически выдаём роль USER при первом логине
+    const baseRoleName = "USER";
+    const roleCheck = await pool.query(
+      "SELECT 1 FROM user_roles WHERE user_id = $1 AND role_name = $2",
+      [userId, baseRoleName]
+    );
+
+    if (roleCheck.rowCount === 0) {
+      try {
+        // используем уже рабочую функцию, которая дергает обёртку
+        const signature = await signAccessOperation(userId, baseRoleName, "GRANT_ROLE");
+
+        await pool.query(
+          "INSERT INTO user_roles (user_id, role_name, signature) VALUES ($1, $2, $3)",
+          [userId, baseRoleName, signature]
+        );
+
+        // лог пишем через audit_logs (можно и через logAudit, как тебе удобнее)
+        await pool.query(
+          "INSERT INTO audit_logs (user_id, action, meta) VALUES ($1, $2, $3)",
+          [
+            userId,
+            "ROLE_ASSIGNED_AUTO",
+            JSON.stringify({ role_name: baseRoleName, from: "keycloak_login" })
+          ]
+        );
+      } catch (e) {
+        console.error("Assign default USER role error:", e);
+        // пользователя не валим, просто пишем в лог
+      }
+    }
+
+    // 4) Возвращаем ответ фронту, как и раньше
+    res.json({
+      status: "ok",
+      source: "keycloak",
+      created,
+      user,
+      token_info: {
+        sub: payload.sub,
+        email: payload.email || null
+      }
+    });
+  } catch (err) {
+    console.error("Error in /auth/keycloak:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
 });
 
 // Админ-эндпоинт для ротации мастер-ключа профиля.
